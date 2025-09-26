@@ -22,6 +22,7 @@ var (
 type MoveReminder struct {
 	app         fyne.App
 	window      fyne.Window
+	breakWindow fyne.Window
 	timerLabel  *widget.Label
 	message     *widget.Label
 	closeButton *widget.Button
@@ -29,6 +30,7 @@ type MoveReminder struct {
 	breakEnd    time.Time
 	workEnd     time.Time
 	workTicker  *time.Ticker
+	timerActive bool
 }
 
 func NewMoveReminder() *MoveReminder {
@@ -47,6 +49,25 @@ func NewMoveReminder() *MoveReminder {
 func (mr *MoveReminder) showBreakWindow() {
 	mr.breakEnd = time.Now().Add(breakDuration)
 
+	// Create a new window for each break
+	mr.breakWindow = mr.app.NewWindow("Move Break")
+
+	// Prevent window from being closed by user during break
+	mr.breakWindow.SetCloseIntercept(func() {
+		remaining := time.Until(mr.breakEnd)
+		if remaining > 0 {
+			// Block window closing during break timer
+			slog.Info("Break window close blocked - break is mandatory (use Cmd+Q to quit app)")
+			// Update message to show options
+			fyne.Do(func() {
+				mr.message.SetText("Break is mandatory and cannot be closed early.\n\nOptions:\n• Press 'S' to skip break\n• Press Cmd+Q to quit application")
+			})
+			return
+		}
+		// Allow closing when break is complete
+		mr.closeBreakWindow()
+	})
+
 	title := widget.NewLabel("Time to Move!")
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
@@ -59,21 +80,20 @@ func (mr *MoveReminder) showBreakWindow() {
 	mr.timerLabel.Alignment = fyne.TextAlignCenter
 	mr.timerLabel.TextStyle = fyne.TextStyle{Bold: true}
 
+	// Only show close button, initially disabled
 	mr.closeButton = widget.NewButton("Close Break", func() {
 		mr.closeBreakWindow()
 	})
 	mr.closeButton.Importance = widget.HighImportance
+	mr.closeButton.Disable() // Disabled until break is complete
 
-	skipButton := widget.NewButton("Skip Break", func() {
-		if mr.ticker != nil {
-			mr.ticker.Stop()
+	// Add keyboard shortcut handler for skip (S key)
+	mr.breakWindow.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
+		if key.Name == fyne.KeyS {
+			slog.Info("Break skipped via keyboard shortcut (S key)")
+			mr.skipBreak()
 		}
-		mr.window.SetFullScreen(false)
-		mr.window.Hide()
-		mr.scheduleNext()
 	})
-
-	buttonContainer := container.NewHBox(skipButton, mr.closeButton)
 
 	content := container.NewVBox(
 		widget.NewSeparator(),
@@ -83,30 +103,37 @@ func (mr *MoveReminder) showBreakWindow() {
 		widget.NewSeparator(),
 		mr.timerLabel,
 		widget.NewSeparator(),
-		buttonContainer,
+		mr.closeButton,
 		widget.NewSeparator(),
+		widget.NewLabel("Press 'S' to skip • Cmd+Q to quit app"),
 	)
 
-	mr.window.SetContent(container.NewCenter(content))
-	mr.window.SetFullScreen(true)
-	mr.window.Show()
-	mr.window.RequestFocus()
+	mr.breakWindow.SetContent(container.NewCenter(content))
+	mr.breakWindow.SetFullScreen(true)
+	mr.breakWindow.Show()
+	mr.breakWindow.RequestFocus()
 
 	mr.ticker = time.NewTicker(time.Second)
 	mr.startTimer()
 }
 
 func (mr *MoveReminder) startTimer() {
+	mr.timerActive = true
 	mr.updateTimer()
 }
 
 func (mr *MoveReminder) updateTimer() {
+	if !mr.timerActive {
+		return // Timer has been stopped
+	}
+
 	remaining := time.Until(mr.breakEnd)
 	if remaining <= 0 {
 		fyne.Do(func() {
 			mr.message.SetText("Break time is complete!\nYou can now close this window and return to work.")
 			mr.timerLabel.SetText("00:00")
 			mr.closeButton.SetText("Return to Work")
+			mr.closeButton.Enable() // Enable the button only when break is complete
 		})
 		return
 	}
@@ -117,15 +144,47 @@ func (mr *MoveReminder) updateTimer() {
 		mr.timerLabel.SetText(fmt.Sprintf("Time remaining: %02d:%02d", minutes, seconds))
 	})
 
-	time.AfterFunc(time.Second, mr.updateTimer)
+	if mr.timerActive {
+		time.AfterFunc(time.Second, mr.updateTimer)
+	}
 }
 
-func (mr *MoveReminder) closeBreakWindow() {
+func (mr *MoveReminder) skipBreak() {
+	slog.Info("Skipping break via keyboard shortcut")
+	mr.timerActive = false
 	if mr.ticker != nil {
 		mr.ticker.Stop()
 	}
-	mr.window.SetFullScreen(false)
-	mr.window.Hide()
+
+	// Close the break window completely
+	if mr.breakWindow != nil {
+		mr.breakWindow.Close()
+	}
+
+	slog.Info("Break skipped, scheduling next work interval")
+	os.Stdout.Sync()
+	mr.scheduleNext()
+}
+
+func (mr *MoveReminder) closeBreakWindow() {
+	slog.Info("Closing break window")
+
+	// Stop all timers immediately
+	mr.timerActive = false
+	if mr.ticker != nil {
+		mr.ticker.Stop()
+	}
+
+	// Disable the button to prevent double-clicks
+	mr.closeButton.Disable()
+
+	// Close the break window completely instead of hiding
+	if mr.breakWindow != nil {
+		mr.breakWindow.Close()
+	}
+
+	slog.Info("Break window closed, scheduling next work interval")
+	os.Stdout.Sync()
 	mr.scheduleNext()
 }
 
@@ -133,9 +192,9 @@ func (mr *MoveReminder) startWorkTimer() {
 	mr.workEnd = time.Now().Add(workInterval)
 
 	// Use different intervals based on verbose flag
-	interval := 30 * time.Second
+	interval := 10 * time.Second
 	if verbose {
-		interval = 10 * time.Second
+		interval = 1 * time.Second
 	}
 
 	mr.workTicker = time.NewTicker(interval)
@@ -186,7 +245,7 @@ func (mr *MoveReminder) start() {
 func main() {
 	workFlag := flag.Duration("work", 25*time.Minute, "Work interval duration (e.g., 25m, 10s)")
 	breakFlag := flag.Duration("break", 5*time.Minute, "Break duration (e.g., 5m, 10s)")
-	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging every 10 seconds")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging every 1 seconds")
 	flag.Parse()
 
 	workInterval = *workFlag
@@ -198,7 +257,7 @@ func main() {
 	os.Stdout.Sync()
 
 	if verbose {
-		slog.Info("Verbose logging enabled - will log every 10 seconds")
+		slog.Info("Verbose logging enabled - will log every 1 seconds")
 		os.Stdout.Sync()
 	}
 
