@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -15,6 +16,7 @@ import (
 var (
 	workInterval  time.Duration
 	breakDuration time.Duration
+	verbose       bool
 )
 
 type MoveReminder struct {
@@ -129,19 +131,29 @@ func (mr *MoveReminder) closeBreakWindow() {
 
 func (mr *MoveReminder) startWorkTimer() {
 	mr.workEnd = time.Now().Add(workInterval)
-	mr.workTicker = time.NewTicker(30 * time.Second) // Log every 30 seconds
+
+	// Use different intervals based on verbose flag
+	interval := 30 * time.Second
+	if verbose {
+		interval = 10 * time.Second
+	}
+
+	mr.workTicker = time.NewTicker(interval)
 
 	go func() {
 		for range mr.workTicker.C {
 			remaining := time.Until(mr.workEnd)
 			if remaining <= 0 {
 				mr.workTicker.Stop()
+				slog.Info("Work interval completed - break time!")
+				os.Stdout.Sync() // Force flush
 				return
 			}
 
 			minutes := int(remaining.Minutes())
 			seconds := int(remaining.Seconds()) % 60
 			slog.Info("Work time remaining", "time", fmt.Sprintf("%02d:%02d", minutes, seconds))
+			os.Stdout.Sync() // Force flush after each log
 		}
 	}()
 }
@@ -154,6 +166,7 @@ func (mr *MoveReminder) stopWorkTimer() {
 
 func (mr *MoveReminder) scheduleNext() {
 	slog.Info("Starting work interval", "duration", workInterval)
+	os.Stdout.Sync()
 	mr.startWorkTimer()
 
 	time.AfterFunc(workInterval, func() {
@@ -173,12 +186,21 @@ func (mr *MoveReminder) start() {
 func main() {
 	workFlag := flag.Duration("work", 25*time.Minute, "Work interval duration (e.g., 25m, 10s)")
 	breakFlag := flag.Duration("break", 5*time.Minute, "Break duration (e.g., 5m, 10s)")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging every 10 seconds")
 	flag.Parse()
 
 	workInterval = *workFlag
 	breakDuration = *breakFlag
+	verbose = *verboseFlag
 
+	// Force logs to be visible by flushing stdout
 	slog.Info("Move reminder configured", "work_interval", workInterval, "break_duration", breakDuration)
+	os.Stdout.Sync()
+
+	if verbose {
+		slog.Info("Verbose logging enabled - will log every 10 seconds")
+		os.Stdout.Sync()
+	}
 
 	reminder := NewMoveReminder()
 	reminder.start()
