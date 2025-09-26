@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -21,168 +23,34 @@ var (
 )
 
 type MoveReminder struct {
-	app         fyne.App
-	window      fyne.Window
-	breakWindow fyne.Window
-	timerLabel  *widget.Label
-	message     *widget.Label
-	closeButton *widget.Button
-	ticker      *time.Ticker
-	breakEnd    time.Time
-	workEnd     time.Time
-	workTicker  *time.Ticker
-	timerActive bool
+	workEnd    time.Time
+	workTicker *time.Ticker
 }
 
 func NewMoveReminder() *MoveReminder {
-	myApp := app.New()
-	myApp.SetIcon(nil)
-
-	window := myApp.NewWindow("Move Reminder")
-	window.CenterOnScreen()
-
-	mr := &MoveReminder{
-		app:    myApp,
-		window: window,
-	}
-
-	// Note: Fyne handles Cmd+Q automatically at OS level,
-	// We use SetCloseIntercept on break windows to detect quit attempts
-
-	return mr
+	return &MoveReminder{}
 }
 
 func (mr *MoveReminder) showBreakWindow() {
-	mr.breakEnd = time.Now().Add(breakDuration)
-
 	// Show system notification
 	mr.showNotification()
 
-	// Create a new window for each break
-	mr.breakWindow = mr.app.NewWindow("Move Break")
-
-	// Intercept close attempts - Cmd+Q should always quit the app
-	mr.breakWindow.SetCloseIntercept(func() {
-		slog.Info("Break window close intercepted - quitting app")
-		mr.timerActive = false
-		if mr.ticker != nil {
-			mr.ticker.Stop()
-		}
-		// Hide window first to stop focus requests
-		mr.breakWindow.Hide()
-		// Give maintainFocus goroutine time to stop before quitting
-		time.Sleep(100 * time.Millisecond)
-		mr.app.Quit()
-	})
-
-	title := widget.NewLabel("Time to Move!")
-	title.TextStyle = fyne.TextStyle{Bold: true}
-	title.Alignment = fyne.TextAlignCenter
-
-	mr.message = widget.NewLabel("Stand up, stretch, and move around.\nTake a break from your computer!")
-	mr.message.Alignment = fyne.TextAlignCenter
-	mr.message.Wrapping = fyne.TextWrapWord
-
-	mr.timerLabel = widget.NewLabel("")
-	mr.timerLabel.Alignment = fyne.TextAlignCenter
-	mr.timerLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	// Only show close button, initially disabled
-	mr.closeButton = widget.NewButton("Close Break", func() {
-		mr.closeBreakWindow()
-	})
-	mr.closeButton.Importance = widget.HighImportance
-	mr.closeButton.Disable() // Disabled until break is complete
-
-	// Add keyboard shortcut handler for skip (S key)
-	mr.breakWindow.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
-		if key.Name == fyne.KeyS {
-			slog.Info("Break skipped via keyboard shortcut (S key)")
-			mr.skipBreak()
-		}
-	})
-
-	content := container.NewVBox(
-		widget.NewSeparator(),
-		title,
-		widget.NewSeparator(),
-		mr.message,
-		widget.NewSeparator(),
-		mr.timerLabel,
-		widget.NewSeparator(),
-		mr.closeButton,
-		widget.NewSeparator(),
-		widget.NewLabel("Press 'S' to skip • Cmd+Q to quit app"),
-	)
-
-	mr.breakWindow.SetContent(container.NewCenter(content))
-	mr.breakWindow.SetFullScreen(true)
-	mr.breakWindow.Show()
-	mr.breakWindow.RequestFocus()
-
-	// Continuously ensure the window stays focused during break
-	go mr.maintainFocus()
-
-	mr.ticker = time.NewTicker(time.Second)
-	mr.startTimer()
-}
-
-func (mr *MoveReminder) startTimer() {
-	mr.timerActive = true
-	mr.updateTimer()
-}
-
-func (mr *MoveReminder) updateTimer() {
-	if !mr.timerActive {
-		return // Timer has been stopped
-	}
-
-	remaining := time.Until(mr.breakEnd)
-	if remaining <= 0 {
-		fyne.Do(func() {
-			mr.message.SetText("Break time is complete!\nYou can now close this window and return to work.")
-			mr.timerLabel.SetText("00:00")
-			mr.closeButton.SetText("Return to Work")
-			mr.closeButton.Enable() // Enable the button only when break is complete
-		})
+	// Launch separate GUI process for break window
+	cmd := exec.Command(os.Args[0], "-break-mode", fmt.Sprintf("-break-duration=%s", breakDuration))
+	err := cmd.Start()
+	if err != nil {
+		slog.Error("Failed to start break window process", "error", err)
 		return
 	}
 
-	minutes := int(remaining.Minutes())
-	seconds := int(remaining.Seconds()) % 60
-	fyne.Do(func() {
-		mr.timerLabel.SetText(fmt.Sprintf("Time remaining: %02d:%02d", minutes, seconds))
-	})
-
-	if mr.timerActive {
-		time.AfterFunc(time.Second, mr.updateTimer)
-	}
-}
-
-func (mr *MoveReminder) skipBreak() {
-	slog.Info("Skipping break via keyboard shortcut")
-	mr.timerActive = false
-	if mr.ticker != nil {
-		mr.ticker.Stop()
-	}
-
-	// Directly close and schedule next - bypass close intercept
-	if mr.breakWindow != nil {
-		mr.breakWindow.Hide()
-	}
-
-	slog.Info("Break skipped, scheduling next work interval")
-	os.Stdout.Sync()
-	mr.scheduleNext()
-}
-
-func (mr *MoveReminder) bringToFront() {
-	// Use AppleScript to bring our app to the front on macOS
-	cmd := exec.Command("osascript", "-e", `tell application "System Events" to set frontmost of first process whose name contains "main" to true`)
-	err := cmd.Run()
+	// Wait for break process to complete
+	err = cmd.Wait()
 	if err != nil {
-		slog.Error("Failed to bring window to front", "error", err)
+		slog.Info("Break process ended", "error", err)
 	}
+
+	slog.Info("Break completed, resuming work")
+	mr.scheduleNext()
 }
 
 func (mr *MoveReminder) showNotification() {
@@ -194,54 +62,6 @@ func (mr *MoveReminder) showNotification() {
 	if err != nil {
 		slog.Error("Failed to show notification", "error", err)
 	}
-}
-
-func (mr *MoveReminder) maintainFocus() {
-	// Keep bringing the break window to front during mandatory break
-	focusTicker := time.NewTicker(1 * time.Second)
-	defer focusTicker.Stop()
-
-	for range focusTicker.C {
-		if !mr.timerActive {
-			break
-		}
-
-		remaining := time.Until(mr.breakEnd)
-		if remaining <= 0 {
-			break
-		}
-
-		// Continuously request focus to keep window active
-		if mr.breakWindow != nil {
-			fyne.Do(func() {
-				mr.breakWindow.RequestFocus()
-			})
-			// Also try to bring to front via system command
-			mr.bringToFront()
-		}
-	}
-}
-
-func (mr *MoveReminder) closeBreakWindow() {
-	slog.Info("Closing break window")
-
-	// Stop all timers immediately
-	mr.timerActive = false
-	if mr.ticker != nil {
-		mr.ticker.Stop()
-	}
-
-	// Disable the button to prevent double-clicks
-	mr.closeButton.Disable()
-
-	// Hide the break window and schedule next work - bypass close intercept
-	if mr.breakWindow != nil {
-		mr.breakWindow.Hide()
-	}
-
-	slog.Info("Break window closed, scheduling next work interval")
-	os.Stdout.Sync()
-	mr.scheduleNext()
 }
 
 func (mr *MoveReminder) startWorkTimer() {
@@ -262,6 +82,7 @@ func (mr *MoveReminder) startWorkTimer() {
 				mr.workTicker.Stop()
 				slog.Info("Work interval completed - break time!")
 				os.Stdout.Sync() // Force flush
+				mr.showBreakWindow()
 				return
 			}
 
@@ -283,30 +104,33 @@ func (mr *MoveReminder) scheduleNext() {
 	slog.Info("Starting work interval", "duration", workInterval)
 	os.Stdout.Sync()
 	mr.startWorkTimer()
-
-	time.AfterFunc(workInterval, func() {
-		mr.stopWorkTimer()
-		fyne.Do(func() {
-			mr.showBreakWindow()
-		})
-	})
 }
 
 func (mr *MoveReminder) start() {
 	slog.Info("Move reminder started", "work_interval", workInterval, "break_duration", breakDuration)
 	mr.scheduleNext()
-	mr.app.Run()
+
+	// Keep the main thread alive
+	select {}
 }
 
 func main() {
 	workFlag := flag.Duration("work", 25*time.Minute, "Work interval duration (e.g., 25m, 10s)")
 	breakFlag := flag.Duration("break", 5*time.Minute, "Break duration (e.g., 5m, 10s)")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging every 1 seconds")
+	breakMode := flag.Bool("break-mode", false, "Run in break window mode (internal use)")
+	breakDurationFlag := flag.Duration("break-duration", 5*time.Minute, "Break duration for break mode")
 	flag.Parse()
 
 	workInterval = *workFlag
 	breakDuration = *breakFlag
 	verbose = *verboseFlag
+
+	// If in break mode, run the GUI break window
+	if *breakMode {
+		runBreakWindow(*breakDurationFlag)
+		return
+	}
 
 	// Force logs to be visible by flushing stdout
 	slog.Info("Move reminder configured", "work_interval", workInterval, "break_duration", breakDuration)
@@ -318,5 +142,222 @@ func main() {
 	}
 
 	reminder := NewMoveReminder()
+
+	// Handle system signals (Cmd+Q) gracefully
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		slog.Info("Received quit signal - exiting")
+		os.Exit(0)
+	}()
+
 	reminder.start()
+}
+
+type BreakWindow struct {
+	app         fyne.App
+	window      fyne.Window
+	timerLabel  *widget.Label
+	message     *widget.Label
+	closeButton *widget.Button
+	ticker      *time.Ticker
+	breakEnd    time.Time
+	timerActive bool
+	duration    time.Duration
+}
+
+func NewBreakWindow(duration time.Duration) *BreakWindow {
+	myApp := app.New()
+	myApp.SetIcon(nil)
+
+	bw := &BreakWindow{
+		app:      myApp,
+		duration: duration,
+	}
+
+	return bw
+}
+
+func (bw *BreakWindow) showBreakWindow() {
+	bw.breakEnd = time.Now().Add(bw.duration)
+
+	// Create break window
+	bw.window = bw.app.NewWindow("Move Break")
+
+	// Intercept close attempts - Cmd+Q should always quit
+	bw.window.SetCloseIntercept(func() {
+		slog.Info("Break window close intercepted - quitting")
+		bw.timerActive = false
+		if bw.ticker != nil {
+			bw.ticker.Stop()
+		}
+		bw.window.Hide()
+		bw.app.Quit()
+	})
+
+	title := widget.NewLabel("Time to Move!")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
+
+	bw.message = widget.NewLabel("Stand up, stretch, and move around.\nTake a break from your computer!")
+	bw.message.Alignment = fyne.TextAlignCenter
+	bw.message.Wrapping = fyne.TextWrapWord
+
+	bw.timerLabel = widget.NewLabel("")
+	bw.timerLabel.Alignment = fyne.TextAlignCenter
+	bw.timerLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	// Only show close button, initially disabled
+	bw.closeButton = widget.NewButton("Close Break", func() {
+		bw.closeBreakWindow()
+	})
+	bw.closeButton.Importance = widget.HighImportance
+	bw.closeButton.Disable() // Disabled until break is complete
+
+	// Add keyboard shortcut handler for skip (S key)
+	bw.window.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
+		if key.Name == fyne.KeyS {
+			slog.Info("Break skipped via keyboard shortcut (S key)")
+			bw.skipBreak()
+		}
+	})
+
+	content := container.NewVBox(
+		widget.NewSeparator(),
+		title,
+		widget.NewSeparator(),
+		bw.message,
+		widget.NewSeparator(),
+		bw.timerLabel,
+		widget.NewSeparator(),
+		bw.closeButton,
+		widget.NewSeparator(),
+		widget.NewLabel("Press 'S' to skip • Cmd+Q to quit app"),
+	)
+
+	bw.window.SetContent(container.NewCenter(content))
+	bw.window.SetFullScreen(true)
+	bw.window.Show()
+	bw.window.RequestFocus()
+
+	// Continuously ensure the window stays focused during break
+	go bw.maintainFocus()
+
+	bw.ticker = time.NewTicker(time.Second)
+	bw.startTimer()
+}
+
+func (bw *BreakWindow) startTimer() {
+	bw.timerActive = true
+	bw.updateTimer()
+}
+
+func (bw *BreakWindow) updateTimer() {
+	if !bw.timerActive {
+		return // Timer has been stopped
+	}
+
+	remaining := time.Until(bw.breakEnd)
+	if remaining <= 0 {
+		fyne.Do(func() {
+			bw.message.SetText("Break time is complete!\nYou can now close this window and return to work.")
+			bw.timerLabel.SetText("00:00")
+			bw.closeButton.SetText("Return to Work")
+			bw.closeButton.Enable() // Enable the button only when break is complete
+		})
+		return
+	}
+
+	minutes := int(remaining.Minutes())
+	seconds := int(remaining.Seconds()) % 60
+	fyne.Do(func() {
+		bw.timerLabel.SetText(fmt.Sprintf("Time remaining: %02d:%02d", minutes, seconds))
+	})
+
+	if bw.timerActive {
+		time.AfterFunc(time.Second, bw.updateTimer)
+	}
+}
+
+func (bw *BreakWindow) skipBreak() {
+	slog.Info("Skipping break via keyboard shortcut")
+	bw.timerActive = false
+	if bw.ticker != nil {
+		bw.ticker.Stop()
+	}
+
+	// Hide the break window
+	if bw.window != nil {
+		bw.window.Hide()
+	}
+
+	slog.Info("Break skipped, exiting break window")
+	bw.app.Quit()
+}
+
+func (bw *BreakWindow) bringToFront() {
+	// Use AppleScript to bring our app to the front on macOS
+	cmd := exec.Command("osascript", "-e", `tell application "System Events" to set frontmost of first process whose name contains "main" to true`)
+	err := cmd.Run()
+	if err != nil {
+		slog.Error("Failed to bring window to front", "error", err)
+	}
+}
+
+func (bw *BreakWindow) maintainFocus() {
+	// Keep bringing the break window to front during mandatory break
+	focusTicker := time.NewTicker(1 * time.Second)
+	defer focusTicker.Stop()
+
+	for range focusTicker.C {
+		if !bw.timerActive {
+			break
+		}
+
+		remaining := time.Until(bw.breakEnd)
+		if remaining <= 0 {
+			break
+		}
+
+		// Continuously request focus to keep window active
+		if bw.window != nil {
+			fyne.Do(func() {
+				bw.window.RequestFocus()
+			})
+			// Also try to bring to front via system command
+			bw.bringToFront()
+		}
+	}
+}
+
+func (bw *BreakWindow) closeBreakWindow() {
+	slog.Info("Closing break window")
+
+	// Stop all timers immediately
+	bw.timerActive = false
+	if bw.ticker != nil {
+		bw.ticker.Stop()
+	}
+
+	// Disable the button to prevent double-clicks
+	bw.closeButton.Disable()
+
+	// Hide the break window
+	if bw.window != nil {
+		bw.window.Hide()
+	}
+
+	slog.Info("Break window closed, exiting")
+	bw.app.Quit()
+}
+
+func (bw *BreakWindow) start() {
+	bw.showBreakWindow()
+	bw.app.Run()
+}
+
+func runBreakWindow(duration time.Duration) {
+	breakWindow := NewBreakWindow(duration)
+	breakWindow.start()
 }
