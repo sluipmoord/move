@@ -1,5 +1,7 @@
 # Agent Guidelines for Move Reminder
 
+Don't use pkill -f main to terminate the app; instead, use the Quit option in the system tray menu to ensure proper cleanup and resource management.
+
 ## Build Commands
 
 - `go build` - Build the main application  
