@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -40,32 +41,38 @@ func NewMoveReminder() *MoveReminder {
 	window := myApp.NewWindow("Move Reminder")
 	window.CenterOnScreen()
 
-	return &MoveReminder{
+	mr := &MoveReminder{
 		app:    myApp,
 		window: window,
 	}
+
+	// Note: Fyne handles Cmd+Q automatically at OS level,
+	// We use SetCloseIntercept on break windows to detect quit attempts
+
+	return mr
 }
 
 func (mr *MoveReminder) showBreakWindow() {
 	mr.breakEnd = time.Now().Add(breakDuration)
 
+	// Show system notification
+	mr.showNotification()
+
 	// Create a new window for each break
 	mr.breakWindow = mr.app.NewWindow("Move Break")
 
-	// Prevent window from being closed by user during break
+	// Intercept close attempts - Cmd+Q should always quit the app
 	mr.breakWindow.SetCloseIntercept(func() {
-		remaining := time.Until(mr.breakEnd)
-		if remaining > 0 {
-			// Block window closing during break timer
-			slog.Info("Break window close blocked - break is mandatory (use Cmd+Q to quit app)")
-			// Update message to show options
-			fyne.Do(func() {
-				mr.message.SetText("Break is mandatory and cannot be closed early.\n\nOptions:\n• Press 'S' to skip break\n• Press Cmd+Q to quit application")
-			})
-			return
+		slog.Info("Break window close intercepted - quitting app")
+		mr.timerActive = false
+		if mr.ticker != nil {
+			mr.ticker.Stop()
 		}
-		// Allow closing when break is complete
-		mr.closeBreakWindow()
+		// Hide window first to stop focus requests
+		mr.breakWindow.Hide()
+		// Give maintainFocus goroutine time to stop before quitting
+		time.Sleep(100 * time.Millisecond)
+		mr.app.Quit()
 	})
 
 	title := widget.NewLabel("Time to Move!")
@@ -113,6 +120,9 @@ func (mr *MoveReminder) showBreakWindow() {
 	mr.breakWindow.Show()
 	mr.breakWindow.RequestFocus()
 
+	// Continuously ensure the window stays focused during break
+	go mr.maintainFocus()
+
 	mr.ticker = time.NewTicker(time.Second)
 	mr.startTimer()
 }
@@ -156,14 +166,60 @@ func (mr *MoveReminder) skipBreak() {
 		mr.ticker.Stop()
 	}
 
-	// Close the break window completely
+	// Directly close and schedule next - bypass close intercept
 	if mr.breakWindow != nil {
-		mr.breakWindow.Close()
+		mr.breakWindow.Hide()
 	}
 
 	slog.Info("Break skipped, scheduling next work interval")
 	os.Stdout.Sync()
 	mr.scheduleNext()
+}
+
+func (mr *MoveReminder) bringToFront() {
+	// Use AppleScript to bring our app to the front on macOS
+	cmd := exec.Command("osascript", "-e", `tell application "System Events" to set frontmost of first process whose name contains "main" to true`)
+	err := cmd.Run()
+	if err != nil {
+		slog.Error("Failed to bring window to front", "error", err)
+	}
+}
+
+func (mr *MoveReminder) showNotification() {
+	// Show system notification on macOS
+	title := "Move Break Time!"
+	message := "Stand up, stretch, and move around. Take a break from your computer!"
+	cmd := exec.Command("osascript", "-e", fmt.Sprintf(`display notification "%s" with title "%s"`, message, title))
+	err := cmd.Run()
+	if err != nil {
+		slog.Error("Failed to show notification", "error", err)
+	}
+}
+
+func (mr *MoveReminder) maintainFocus() {
+	// Keep bringing the break window to front during mandatory break
+	focusTicker := time.NewTicker(1 * time.Second)
+	defer focusTicker.Stop()
+
+	for range focusTicker.C {
+		if !mr.timerActive {
+			break
+		}
+
+		remaining := time.Until(mr.breakEnd)
+		if remaining <= 0 {
+			break
+		}
+
+		// Continuously request focus to keep window active
+		if mr.breakWindow != nil {
+			fyne.Do(func() {
+				mr.breakWindow.RequestFocus()
+			})
+			// Also try to bring to front via system command
+			mr.bringToFront()
+		}
+	}
 }
 
 func (mr *MoveReminder) closeBreakWindow() {
@@ -178,9 +234,9 @@ func (mr *MoveReminder) closeBreakWindow() {
 	// Disable the button to prevent double-clicks
 	mr.closeButton.Disable()
 
-	// Close the break window completely instead of hiding
+	// Hide the break window and schedule next work - bypass close intercept
 	if mr.breakWindow != nil {
-		mr.breakWindow.Close()
+		mr.breakWindow.Hide()
 	}
 
 	slog.Info("Break window closed, scheduling next work interval")
